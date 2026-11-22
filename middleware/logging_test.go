@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +21,12 @@ import (
 
 // logEntry is a decoded slog JSON line.
 type logEntry map[string]any
+
+// writerFunc adapts a function to io.Writer so a test can observe when a log
+// line is written relative to the handler returning.
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
 // requestCase describes one request/response pair exercised through the
 // logging middleware.
@@ -182,6 +189,43 @@ func TestLoggingMakesDurationObservable(t *testing.T) {
 	}
 	if duration < 20 {
 		t.Errorf("log duration_ms = %v, want at least 20 for a 20ms handler", duration)
+	}
+}
+
+// TestLoggingEmitsLineAfterHandlerFinishes pins the ordering half of the T-2
+// acceptance criterion: the line is written once the handler has finished, not
+// while it is still running, and it is written only once.
+func TestLoggingEmitsLineAfterHandlerFinishes(t *testing.T) {
+	var handlerFinished atomic.Bool
+	var writtenAfterHandler atomic.Bool
+	var lines atomic.Int64
+
+	logger := slog.New(slog.NewJSONHandler(writerFunc(func(p []byte) (int, error) {
+		lines.Add(1)
+		if handlerFinished.Load() {
+			writtenAfterHandler.Store(true)
+		}
+		return len(p), nil
+	}), nil))
+
+	handler := middleware.Logging(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Runs as the handler returns, i.e. before the middleware's deferred
+		// log call.
+		defer handlerFinished.Store(true)
+		w.WriteHeader(http.StatusCreated)
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/created", nil))
+
+	if got, want := rec.Code, http.StatusCreated; got != want {
+		t.Fatalf("response status = %d, want %d", got, want)
+	}
+	if !writtenAfterHandler.Load() {
+		t.Error("log line was written before the handler finished")
+	}
+	if got := lines.Load(); got != 1 {
+		t.Errorf("log output has %d lines, want exactly 1", got)
 	}
 }
 
