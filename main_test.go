@@ -43,6 +43,7 @@ func TestNewHandlerLogsEveryRequest(t *testing.T) {
 		wantStatus int
 	}{
 		{name: "sample route", method: http.MethodGet, path: "/", wantStatus: http.StatusOK},
+		{name: "health route", method: http.MethodGet, path: "/health", wantStatus: http.StatusOK},
 		{name: "unknown route", method: http.MethodGet, path: "/nope", wantStatus: http.StatusNotFound},
 	}
 
@@ -113,6 +114,57 @@ func TestNewHandlerServesSampleRoute(t *testing.T) {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 	if got, want := string(body), `{"service":"pilot-go"}`; got != want {
+		t.Errorf("body = %q, want %q", got, want)
+	}
+}
+
+// TestNewHandlerServesHealth is the acceptance test for T-1: GET /health over
+// real HTTP returns 200 with exactly {"status":"ok"}, so a deploy can check
+// liveness. The body is compared byte-for-byte on purpose; a trailing newline
+// would fail here.
+func TestNewHandlerServesHealth(t *testing.T) {
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	srv := httptest.NewServer(newHandler(logger))
+	defer srv.Close()
+
+	resp, err := srv.Client().Get(srv.URL + "/health")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if got, want := string(body), `{"status":"ok"}`; got != want {
+		t.Errorf("body = %q, want %q", got, want)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.Contains(got, "application/json") {
+		t.Errorf("Content-Type = %q, want it to contain application/json", got)
+	}
+}
+
+// TestHealthDoesNotTouchAnyStore documents and enforces the "without touching
+// the database" part of T-1: the health handler is served even when no store or
+// database is wired into newHandler at all. A liveness check that depended on a
+// datastore would make a DB outage look like a dead process.
+func TestHealthDoesNotTouchAnyStore(t *testing.T) {
+	// newHandler takes only a logger, so there is no datastore in scope for the
+	// handler to reach. Assert the route answers 200 without any setup beyond
+	// the routes themselves.
+	h := newHandler(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got, want := rec.Body.String(), `{"status":"ok"}`; got != want {
 		t.Errorf("body = %q, want %q", got, want)
 	}
 }
