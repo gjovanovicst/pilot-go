@@ -51,7 +51,10 @@ func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter 
 // bodies are never logged, so request parameters do not leak into the logs.
 //
 // The line is emitted from a deferred call, so it is written for every request
-// that reaches the wrapper, including requests whose handler panics.
+// that reaches the wrapper, including requests whose handler panics. For a
+// panic that happens before any header was written the logged status is 500,
+// because that is what net/http sends to the client in that case; the panic is
+// then re-raised unchanged so net/http keeps its usual behaviour.
 func Logging(logger *slog.Logger) func(http.Handler) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
@@ -63,12 +66,25 @@ func Logging(logger *slog.Logger) func(http.Handler) http.Handler {
 			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 
 			defer func() {
+				recovered := recover()
+
+				// A panic aborts the response; net/http answers with 500 when
+				// nothing has been written yet. Record that so the log line does
+				// not claim a 200 for a failed request.
+				if recovered != nil && !rec.wroteHeader {
+					rec.status = http.StatusInternalServerError
+				}
+
 				logger.Info("http request",
 					slog.String("method", r.Method),
 					slog.String("path", r.URL.Path),
 					slog.Int("status", rec.status),
 					slog.Int64("duration_ms", time.Since(start).Milliseconds()),
 				)
+
+				if recovered != nil {
+					panic(recovered)
+				}
 			}()
 
 			next.ServeHTTP(rec, r)

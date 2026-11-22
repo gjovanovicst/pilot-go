@@ -186,29 +186,61 @@ func TestLoggingMakesDurationObservable(t *testing.T) {
 }
 
 // TestLoggingEmitsLineWhenHandlerPanics makes sure a panicking handler is still
-// accounted for: the deferred log line is written before the panic continues.
+// accounted for: exactly one log line is written before the panic continues,
+// carrying the contract fields, and the status is the one the client actually
+// sees (500 when nothing was written yet, otherwise the status already sent).
 func TestLoggingEmitsLineWhenHandlerPanics(t *testing.T) {
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&buf, nil))
-	handler := middleware.Logging(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		panic("handler exploded")
-	}))
-
-	func() {
-		defer func() {
-			if recover() == nil {
-				t.Fatal("expected the handler panic to keep propagating")
-			}
-		}()
-		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/panic", nil))
-	}()
-
-	entry := singleEntry(t, buf.String())
-	if got, want := entry["path"], "/panic"; got != want {
-		t.Errorf("log path = %v, want %v", got, want)
+	tests := []struct {
+		name       string
+		handler    http.HandlerFunc
+		wantStatus int
+	}{
+		{
+			name: "panic before any header is 500",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				panic("handler exploded")
+			},
+			wantStatus: http.StatusInternalServerError,
+		},
+		{
+			name: "panic after a header keeps the status already sent",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusTeapot)
+				panic("handler exploded after the header")
+			},
+			wantStatus: http.StatusTeapot,
+		},
 	}
-	if _, ok := entry["duration_ms"]; !ok {
-		t.Errorf("log line is missing duration_ms: %v", entry)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&buf, nil))
+			handler := middleware.Logging(logger)(tc.handler)
+
+			func() {
+				defer func() {
+					if recover() == nil {
+						t.Fatal("expected the handler panic to keep propagating")
+					}
+				}()
+				handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/panic", nil))
+			}()
+
+			entry := singleEntry(t, buf.String())
+			if got, want := entry["method"], http.MethodGet; got != want {
+				t.Errorf("log method = %v, want %v", got, want)
+			}
+			if got, want := entry["path"], "/panic"; got != want {
+				t.Errorf("log path = %v, want %v", got, want)
+			}
+			if got, want := entry["status"], float64(tc.wantStatus); got != want {
+				t.Errorf("log status = %v, want %v", got, want)
+			}
+			if _, ok := entry["duration_ms"]; !ok {
+				t.Errorf("log line is missing duration_ms: %v", entry)
+			}
+		})
 	}
 }
 
