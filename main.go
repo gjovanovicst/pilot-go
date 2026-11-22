@@ -74,5 +74,15 @@ func newHandler(logger *slog.Logger) http.Handler {
 		_, _ = w.Write([]byte(`{"service":"pilot-go"}`))
 	})
 
+	// Liveness probe for deploys. It stays dependency-free on purpose: no
+	// store or database is touched, so a failing datastore cannot make the
+	// process look dead. The body is written as literal bytes (not via
+	// json.NewEncoder, which appends a newline) so it is exactly
+	// {"status":"ok"}.
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+
 	return middleware.Logging(logger)(mux)
 }
