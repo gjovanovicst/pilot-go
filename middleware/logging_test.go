@@ -12,7 +12,6 @@ import (
 	"net/http/httptest"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -195,23 +194,29 @@ func TestLoggingMakesDurationObservable(t *testing.T) {
 // TestLoggingEmitsLineAfterHandlerFinishes pins the ordering half of the T-2
 // acceptance criterion: the line is written once the handler has finished, not
 // while it is still running, and it is written only once.
+//
+// "Only once" is measured on the records decoded out of the buffer (the same
+// way singleEntry does) instead of on io.Writer calls, so the assertion still
+// holds if a handler ever split or batched a record across several writes.
 func TestLoggingEmitsLineAfterHandlerFinishes(t *testing.T) {
-	var handlerFinished atomic.Bool
-	var writtenAfterHandler atomic.Bool
-	var lines atomic.Int64
+	// slog handlers write synchronously on the request goroutine, so plain
+	// variables are sufficient here: there is no second goroutine that could
+	// race with these reads.
+	var handlerFinished bool
+	var writtenAfterHandler bool
+	var buf bytes.Buffer
 
 	logger := slog.New(slog.NewJSONHandler(writerFunc(func(p []byte) (int, error) {
-		lines.Add(1)
-		if handlerFinished.Load() {
-			writtenAfterHandler.Store(true)
+		if handlerFinished {
+			writtenAfterHandler = true
 		}
-		return len(p), nil
+		return buf.Write(p)
 	}), nil))
 
 	handler := middleware.Logging(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Runs as the handler returns, i.e. before the middleware's deferred
 		// log call.
-		defer handlerFinished.Store(true)
+		defer func() { handlerFinished = true }()
 		w.WriteHeader(http.StatusCreated)
 	}))
 
@@ -221,11 +226,21 @@ func TestLoggingEmitsLineAfterHandlerFinishes(t *testing.T) {
 	if got, want := rec.Code, http.StatusCreated; got != want {
 		t.Fatalf("response status = %d, want %d", got, want)
 	}
-	if !writtenAfterHandler.Load() {
+	if !writtenAfterHandler {
 		t.Error("log line was written before the handler finished")
 	}
-	if got := lines.Load(); got != 1 {
-		t.Errorf("log output has %d lines, want exactly 1", got)
+
+	// singleEntry fails unless the buffer holds exactly one decodable JSON
+	// record, which is the "written only once" half of the criterion.
+	entry := singleEntry(t, buf.String())
+	if got, want := entry["path"], "/created"; got != want {
+		t.Errorf("log path = %v, want %v", got, want)
+	}
+	if got, want := entry["status"], float64(http.StatusCreated); got != want {
+		t.Errorf("log status = %v, want %v", got, want)
+	}
+	if _, ok := entry["duration_ms"]; !ok {
+		t.Errorf("log line is missing duration_ms: %v", entry)
 	}
 }
 
