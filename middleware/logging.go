@@ -3,6 +3,7 @@ package middleware
 
 import (
 	"log/slog"
+	"math"
 	"net/http"
 	"time"
 )
@@ -42,10 +43,26 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 // and by net/http itself.
 func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
+// durationMillis converts a measured handler duration into milliseconds. The
+// value is fractional and rounded to microsecond resolution, so a handler that
+// finishes faster than a millisecond reports a small non-zero number instead of
+// a flat 0. The unit stays milliseconds and the JSON key stays duration_ms.
+// Negative measurements (which time.Since should never produce) clamp to 0.
+func durationMillis(d time.Duration) float64 {
+	if d <= 0 {
+		return 0
+	}
+	return math.Round(float64(d)/float64(time.Microsecond)) / 1000
+}
+
 // Logging returns middleware that emits exactly one structured log line per
 // HTTP request once the wrapped handler finishes. The line carries the request
 // method, the request path, the response status and the handler duration in
-// whole milliseconds.
+// milliseconds.
+//
+// duration_ms is a fractional number with microsecond resolution (for example
+// 0.412 for a 412µs handler), so fast handlers stay measurable instead of being
+// truncated to 0. The key and the unit are unchanged.
 //
 // The path is taken from r.URL.Path on purpose: query strings, headers and
 // bodies are never logged, so request parameters do not leak into the logs.
@@ -79,7 +96,7 @@ func Logging(logger *slog.Logger) func(http.Handler) http.Handler {
 					slog.String("method", r.Method),
 					slog.String("path", r.URL.Path),
 					slog.Int("status", rec.status),
-					slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+					slog.Float64("duration_ms", durationMillis(time.Since(start))),
 				)
 
 				if recovered != nil {

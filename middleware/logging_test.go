@@ -125,8 +125,10 @@ func TestLoggingEmitsOneLinePerRequest(t *testing.T) {
 			if duration < 0 {
 				t.Errorf("log duration_ms = %v, want a non-negative value", duration)
 			}
-			if math.Trunc(duration) != duration {
-				t.Errorf("log duration_ms = %v, want whole milliseconds", duration)
+			// The value is fractional milliseconds rounded to the microsecond,
+			// so a millisecond equals exactly 1000 representable steps.
+			if micros := duration * 1000; math.Abs(micros-math.Round(micros)) > 1e-9 {
+				t.Errorf("log duration_ms = %v, want microsecond resolution", duration)
 			}
 		})
 	}
@@ -164,24 +166,64 @@ func TestLoggingEmitsExactlyTheContractKeys(t *testing.T) {
 }
 
 // TestLoggingMakesDurationObservable verifies that duration_ms reflects the
-// handler runtime instead of being a constant zero.
+// handler runtime instead of being a constant zero, and that handlers faster
+// than a millisecond still log a usable (non-zero) duration instead of 0.
 func TestLoggingMakesDurationObservable(t *testing.T) {
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&buf, nil))
-	handler := middleware.Logging(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(20 * time.Millisecond)
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/slow", nil))
-
-	entry := singleEntry(t, buf.String())
-	duration, ok := entry["duration_ms"].(float64)
-	if !ok {
-		t.Fatalf("log duration_ms = %v (%T), want a JSON number", entry["duration_ms"], entry["duration_ms"])
+	tests := []struct {
+		name    string
+		handler http.HandlerFunc
+		wantMin float64
+		wantMax float64
+	}{
+		{
+			name: "fast sub-millisecond handler is not logged as zero",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				time.Sleep(300 * time.Microsecond)
+				w.WriteHeader(http.StatusOK)
+			},
+			wantMin: 0.3,
+			wantMax: math.Inf(1),
+		},
+		{
+			name: "20ms handler",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				time.Sleep(20 * time.Millisecond)
+				w.WriteHeader(http.StatusOK)
+			},
+			wantMin: 20,
+			wantMax: math.Inf(1),
+		},
+		{
+			name: "1.5ms handler keeps its fraction",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				time.Sleep(1500 * time.Microsecond)
+				w.WriteHeader(http.StatusOK)
+			},
+			wantMin: 1.5,
+			wantMax: math.Inf(1),
+		},
 	}
-	if duration < 20 {
-		t.Errorf("log duration_ms = %v, want at least 20 for a 20ms handler", duration)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&buf, nil))
+			handler := middleware.Logging(logger)(tc.handler)
+
+			handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/slow", nil))
+
+			entry := singleEntry(t, buf.String())
+			duration, ok := entry["duration_ms"].(float64)
+			if !ok {
+				t.Fatalf("log duration_ms = %v (%T), want a JSON number", entry["duration_ms"], entry["duration_ms"])
+			}
+			if duration < tc.wantMin {
+				t.Errorf("log duration_ms = %v, want at least %v", duration, tc.wantMin)
+			}
+			if duration > tc.wantMax {
+				t.Errorf("log duration_ms = %v, want at most %v", duration, tc.wantMax)
+			}
+		})
 	}
 }
 
